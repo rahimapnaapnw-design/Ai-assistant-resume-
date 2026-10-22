@@ -223,6 +223,33 @@ def is_temporary_error(exc: Exception) -> bool:
     return any(w in low for w in ("unavailable", "overloaded", "high demand", "resource_exhausted", "timed out"))
 
 
+def discover_flash_models(client) -> list:
+    """Ask the Gemini API which Flash text models this key can use, best first."""
+    found = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None)
+            if actions is not None and "generateContent" not in actions:
+                continue
+            low = name.lower()
+            if not low.startswith("gemini") or "flash" not in low:
+                continue
+            if any(t in low for t in ("image", "tts", "live", "audio", "embedding", "robotics", "computer-use", "native")):
+                continue
+            found.append(name)
+    except Exception:  # noqa: BLE001
+        return []
+
+    def rank(n: str):
+        v = re.search(r"gemini-(\d+(?:\.\d+)?)", n)
+        version = float(v.group(1)) if v else 0.0
+        unstable = any(t in n for t in ("preview", "exp", "-latest"))
+        return (unstable, "lite" in n, -version, n)
+
+    return sorted(set(found), key=rank)
+
+
 def analyze_resume(
     api_key: str,
     model: str,
@@ -234,9 +261,15 @@ def analyze_resume(
     prompt = build_prompt(resume_text, job_description)
     config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
 
-    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    queue = [model] + [m for m in FALLBACK_MODELS if m != model]
+    tried = set()
+    discovered = False
     last_exc = None
-    for current in models:
+    while queue:
+        current = queue.pop(0)
+        if current in tried:
+            continue
+        tried.add(current)
         for attempt in range(ATTEMPTS_PER_MODEL):
             try:
                 response = client.models.generate_content(model=current, contents=prompt, config=config)
@@ -245,12 +278,15 @@ def analyze_resume(
                 return result
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                if _error_code(exc) == 404 and current != model:
-                    break  # fallback model name no longer exists, try the next one
-                if _error_code(exc) == 404 or not (
-                    is_temporary_error(exc) or isinstance(exc, ValueError)
-                ):
-                    raise  # bad key, bad request, unknown model chosen by the user...
+                if _error_code(exc) == 404:
+                    # Model name doesn't exist for this key. Ask the API which Flash
+                    # models are available (once) and try those next.
+                    if not discovered:
+                        discovered = True
+                        queue[0:0] = discover_flash_models(client)
+                    break
+                if not (is_temporary_error(exc) or isinstance(exc, ValueError)):
+                    raise  # bad key, bad request, etc. - retrying won't help
                 if attempt < ATTEMPTS_PER_MODEL - 1:
                     sleep(RETRY_BASE_DELAY * (2**attempt))
     raise last_exc
