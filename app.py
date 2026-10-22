@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -27,6 +28,12 @@ MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 30000
 MAX_JD_CHARS = 10000
 MIN_RESUME_CHARS = 150
+
+# If the chosen model is overloaded (503) or rate limited (429), the app retries
+# with a short backoff and then falls back to these models in order.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+ATTEMPTS_PER_MODEL = 3
+RETRY_BASE_DELAY = 2  # seconds; doubles each retry (2s, 4s)
 
 SCORE_CATEGORIES = {
     "keywords": "Keywords & Relevance",
@@ -200,17 +207,53 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_resume(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def _error_code(exc: Exception):
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return code
+    match = re.match(r"\s*(\d{3})\b", str(exc))
+    return int(match.group(1)) if match else None
+
+
+def is_temporary_error(exc: Exception) -> bool:
+    """True for overload / rate-limit / server errors that are worth retrying."""
+    if _error_code(exc) in (429, 500, 502, 503, 504):
+        return True
+    low = str(exc).lower()
+    return any(w in low for w in ("unavailable", "overloaded", "high demand", "resource_exhausted", "timed out"))
+
+
+def analyze_resume(
+    api_key: str,
+    model: str,
+    resume_text: str,
+    job_description: str,
+    sleep=time.sleep,
+) -> dict:
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            response_mime_type="application/json",
-        ),
-    )
-    return normalize_result(parse_json_response(response.text))
+    prompt = build_prompt(resume_text, job_description)
+    config = types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc = None
+    for current in models:
+        for attempt in range(ATTEMPTS_PER_MODEL):
+            try:
+                response = client.models.generate_content(model=current, contents=prompt, config=config)
+                result = normalize_result(parse_json_response(response.text))
+                result["model_used"] = current
+                return result
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                if _error_code(exc) == 404 and current != model:
+                    break  # fallback model name no longer exists, try the next one
+                if _error_code(exc) == 404 or not (
+                    is_temporary_error(exc) or isinstance(exc, ValueError)
+                ):
+                    raise  # bad key, bad request, unknown model chosen by the user...
+                if attempt < ATTEMPTS_PER_MODEL - 1:
+                    sleep(RETRY_BASE_DELAY * (2**attempt))
+    raise last_exc
 
 
 def friendly_error(exc: Exception) -> str:
@@ -218,6 +261,11 @@ def friendly_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "Your Gemini API key looks invalid or lacks permission. Please check it."
+    if "503" in low or "unavailable" in low or "high demand" in low:
+        return (
+            "Google's Gemini servers are overloaded right now (all models tried). "
+            "This is temporary - please wait a minute and click Analyze again."
+        )
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Gemini rate limit or quota reached. Please wait a minute and try again."
     if "404" in low or "not found" in low:
@@ -255,6 +303,8 @@ def render_results(result: dict) -> None:
         st.progress(overall / 100)
         if result["detected_role"]:
             st.caption(f"Detected target role: **{result['detected_role']}**")
+        if result.get("model_used"):
+            st.caption(f"Analyzed with: `{result['model_used']}`")
     with right:
         if result["summary"]:
             st.markdown("#### Summary")
